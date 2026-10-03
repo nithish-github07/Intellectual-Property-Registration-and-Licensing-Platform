@@ -3,6 +3,12 @@ import { createRoot } from "react-dom/client";
 import { ethers } from "ethers";
 import "./style.css";
 import { pinToIpfs, ipfsUrl } from "./ipfs.js";
+import CreatorPortfolio from "./components/CreatorPortfolio.jsx";
+import LicenseeVault from "./components/LicenseeVault.jsx";
+import HashField from "./components/HashField.jsx";
+import Marketplace from "./components/Marketplace.jsx";
+import TermsModal from "./components/TermsModal.jsx";
+import { useToasts, ToastContainer } from "./components/TxToast.jsx";
 
 const SEPOLIA_CHAIN_ID = "0xaa36a7"; // 11155111 in hex
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
@@ -17,7 +23,8 @@ const REGISTRY_ABI = [
   "function royaltyInfo(uint256 tokenId, uint256 salePrice) view returns (address receiver, uint256 royaltyAmount)",
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function hashToTokenId(bytes32) view returns (uint256)",
-  "event ContentRegistered(uint256 indexed tokenId, address indexed creator, bytes32 indexed contentHash, string ipfsCid, uint256 timestamp)"
+  "event ContentRegistered(uint256 indexed tokenId, address indexed creator, bytes32 indexed contentHash, string ipfsCid, uint256 timestamp)",
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
 ];
 
 const LICENSE_ABI = [
@@ -30,10 +37,18 @@ const LICENSE_ABI = [
   "function useLicense(uint256 licenseId)",
   "function revokeLicense(uint256 licenseId)",
   "event LicensePurchased(uint256 indexed licenseId, uint256 indexed parentTokenId, address indexed licensee, address licensor, uint256 pricePaid, uint256 endTime, uint8 licenseType)",
-  "event LicenseTermsUpdated(uint256 indexed parentTokenId, uint256 price, uint256 duration, uint256 maxUses, uint8 licenseType, bool active)"
+  "event LicenseTermsUpdated(uint256 indexed parentTokenId, uint256 price, uint256 duration, uint256 maxUses, uint8 licenseType, bool active)",
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
 ];
 
 const LICENSE_TYPES = ["Personal", "Commercial", "Exclusive"];
+const TABS = [
+  ["marketplace", "Marketplace"],
+  ["register", "Register"],
+  ["portfolio", "My IP"],
+  ["licenses", "My Licenses"],
+  ["verify", "Verify"],
+];
 
 // Dedicated direct Sepolia JSON-RPC provider for read calls
 function getSepoliaReadProvider() {
@@ -41,7 +56,7 @@ function getSepoliaReadProvider() {
 }
 
 function App() {
-  const [tab, setTab] = useState("register");
+  const [tab, setTab] = useState("marketplace");
   const [account, setAccount] = useState("");
   const [isSepolia, setIsSepolia] = useState(false);
 
@@ -79,8 +94,19 @@ function App() {
   const [licenseValid, setLicenseValid] = useState(false);
   const [licenseStatus, setLicenseStatus] = useState("");
 
+  // Guided-flow state
+  const [toasts, addToast, removeToast, updateToast] = useToasts();
+  const [registered, setRegistered] = useState(null);
+  const [registering, setRegistering] = useState(false);
+  const [registerStep, setRegisterStep] = useState("");
+  const [termsModal, setTermsModal] = useState(null);
+  const [portfolioKey, setPortfolioKey] = useState(0);
+  const [marketKey, setMarketKey] = useState(0);
+  const [vaultKey, setVaultKey] = useState(0);
+
   const registryAddress = import.meta.env.VITE_CONTRACT_ADDRESS || DEFAULT_REGISTRY_ADDRESS;
   const licenseAddress = import.meta.env.VITE_LICENSE_ADDRESS || DEFAULT_LICENSE_ADDRESS;
+  const deployBlock = parseInt(import.meta.env.VITE_DEPLOY_BLOCK || "0", 10);
 
   async function checkNetwork(provider) {
     try {
@@ -223,48 +249,6 @@ function App() {
     executeVerification(hex);
   }
 
-  async function registerContent() {
-    try {
-      if (!account) await connectWallet();
-      const onSepolia = await ensureSepoliaNetwork();
-      if (!onSepolia) throw new Error("Please switch MetaMask to Sepolia Testnet.");
-
-      if (!file || !hash) throw new Error("Please select a file to register.");
-      if (isAlreadyRegistered) {
-        throw new Error(`This content is already registered on Sepolia as NFT #${isAlreadyRegistered.tokenId}!`);
-      }
-
-      setRegisterStatus("1/4: Uploading and pinning file to IPFS via Pinata...");
-      const ipfsData = await pinToIpfs(file, hash);
-      const finalCid = ipfsData.cid || cid || "";
-      setCid(finalCid);
-
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(registryAddress, REGISTRY_ABI, signer);
-
-      setRegisterStatus(`2/4: Pinned to IPFS (${finalCid.slice(0, 12)}...). Confirm registration in your MetaMask wallet...`);
-      const tx = await contract.registerContent(hash, finalCid);
-
-      setRegisterStatus(`3/4: Transaction broadcast (Hash: ${tx.hash.slice(0, 14)}...). Waiting for Sepolia block confirmation...`);
-      const receipt = await tx.wait();
-
-      setRegisterStatus(`✓ Successfully registered on Sepolia! Block #${receipt.blockNumber} (Tx: ${tx.hash})`);
-
-      // Update state so verify card is immediately in sync
-      setIsAlreadyRegistered({
-        tokenId: "Just Registered",
-        owner: account,
-        timestamp: Math.floor(Date.now() / 1000)
-      });
-      setVerifyFile(file);
-      setVerifyHash(hash);
-      executeVerification(hash);
-    } catch (err) {
-      setRegisterStatus(`Error: ${err.shortMessage || err.message}`);
-    }
-  }
-
   async function executeVerification(targetHash) {
     try {
       const hashToQuery = targetHash || verifyHash;
@@ -282,7 +266,7 @@ function App() {
         try {
           const rec = await contract.records(tokenId);
           ipfsCid = rec.ipfsCid;
-        } catch (_) {}
+        } catch (_) { }
 
         setVerifyResult({
           owner,
@@ -297,91 +281,6 @@ function App() {
       }
     } catch (err) {
       setVerifyStatus(`Error: ${err.shortMessage || err.message}`);
-    }
-  }
-
-  // Fetch listing terms for an IP
-  async function queryMarketTerms() {
-    try {
-      if (!marketTokenId) throw new Error("Enter an IP Token ID.");
-
-      const readProvider = getSepoliaReadProvider();
-      const licenseContract = new ethers.Contract(licenseAddress, LICENSE_ABI, readProvider);
-
-      setMarketStatus("Fetching licensing terms from Sepolia...");
-      const terms = await licenseContract.listings(marketTokenId);
-      setMarketTerms({
-        price: ethers.formatEther(terms.price),
-        rawPrice: terms.price,
-        duration: Number(terms.duration),
-        maxUses: Number(terms.maxUses),
-        licenseType: Number(terms.licenseType),
-        active: terms.active
-      });
-      setMarketStatus("");
-    } catch (err) {
-      setMarketTerms(null);
-      setMarketStatus(`Error: ${err.shortMessage || err.message}`);
-    }
-  }
-
-  // Buy License with ETH
-  async function buyLicenseNft() {
-    try {
-      if (!account) await connectWallet();
-      const onSepolia = await ensureSepoliaNetwork();
-      if (!onSepolia) throw new Error("Please switch MetaMask to Sepolia Testnet.");
-
-      if (!marketTokenId || !marketTerms) throw new Error("Search for a valid IP Token first.");
-      if (!marketTerms.active) throw new Error("Licensing is currently not active for this IP.");
-
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-      const licenseContract = new ethers.Contract(licenseAddress, LICENSE_ABI, signer);
-
-      setMarketStatus(`Initiating license purchase for ${marketTerms.price} Sepolia ETH... Confirm in MetaMask.`);
-      const tx = await licenseContract.buyLicense(marketTokenId, {
-        value: marketTerms.rawPrice
-      });
-      setMarketStatus("Transaction submitted to Sepolia. Awaiting block confirmation...");
-      const receipt = await tx.wait();
-      setMarketStatus(`✓ License NFT purchased on Sepolia! Block #${receipt.blockNumber} (Tx: ${receipt.hash})`);
-    } catch (err) {
-      setMarketStatus(`Error: ${err.shortMessage || err.message}`);
-    }
-  }
-
-  // Set licensing terms (Creator)
-  async function configureTerms() {
-    try {
-      if (!account) await connectWallet();
-      const onSepolia = await ensureSepoliaNetwork();
-      if (!onSepolia) throw new Error("Please switch MetaMask to Sepolia Testnet.");
-
-      if (!termsTokenId) throw new Error("Specify the Parent Token ID.");
-
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-      const licenseContract = new ethers.Contract(licenseAddress, LICENSE_ABI, signer);
-
-      const priceWei = ethers.parseEther(termsPrice || "0");
-      const durationSec = parseInt(termsDurationDays || "0", 10) * 86400;
-      const uses = parseInt(termsMaxUses || "0", 10);
-
-      setTermsStatus("Confirm terms update in your MetaMask wallet...");
-      const tx = await licenseContract.setListingTerms(
-        termsTokenId,
-        priceWei,
-        durationSec,
-        uses,
-        parseInt(termsType, 10),
-        termsActive
-      );
-      setTermsStatus("Awaiting block confirmation on Sepolia...");
-      await tx.wait();
-      setTermsStatus(`✓ Terms updated on-chain! Tx: ${tx.hash}`);
-    } catch (err) {
-      setTermsStatus(`Error: ${err.shortMessage || err.message}`);
     }
   }
 
@@ -461,29 +360,164 @@ function App() {
     }
   }
 
+  function friendlyError(err) {
+    if (err?.code === "ACTION_REJECTED" || err?.code === 4001) return "You cancelled the request in your wallet.";
+    if (err?.code === "INSUFFICIENT_FUNDS") return "Not enough Sepolia ETH in this wallet for the price and gas.";
+    return err?.shortMessage || err?.reason || err?.message || "Something went wrong.";
+  }
+
+  // One place for every transaction: wallet prompt -> pending -> confirmed/failed, shown as a toast
+  async function runTx(label, send, okMessage) {
+    if (!account) await connectWallet();
+    const id = addToast("pending", `${label}: confirm in your wallet…`);
+    try {
+      if (!(await ensureSepoliaNetwork())) throw new Error("Switch your wallet to Sepolia to continue.");
+      const signer = await new ethers.BrowserProvider(window.ethereum).getSigner();
+      const tx = await send(signer);
+      updateToast(id, { message: `${label}: waiting for confirmation…`, txHash: tx.hash });
+      const receipt = await tx.wait();
+      updateToast(id, { type: "success", message: okMessage || `${label}: confirmed` });
+      return receipt;
+    } catch (err) {
+      updateToast(id, { type: "error", message: friendlyError(err) });
+      return null;
+    }
+  }
+
+  function resetRegister() {
+    setFile(null); setHash(""); setCid(""); setIsAlreadyRegistered(null); setRegistered(null);
+  }
+
+  async function registerContent() {
+    if (!file || !hash || isAlreadyRegistered) return;
+    setRegistering(true);
+    let finalCid = cid;
+    setRegisterStep("Pinning your file to IPFS…");
+    try {
+      const data = await pinToIpfs(file, hash);
+      finalCid = data.cid || cid || "";
+      setCid(finalCid);
+    } catch {
+      addToast("error", "Couldn't pin to IPFS (upload service unreachable). Registering the file fingerprint only.");
+    }
+    setRegisterStep("");
+    const receipt = await runTx(
+      "Register IP",
+      (signer) => new ethers.Contract(registryAddress, REGISTRY_ABI, signer).registerContent(hash, finalCid),
+      "Your work is registered on Sepolia"
+    );
+    if (receipt) {
+      const iface = new ethers.Interface(REGISTRY_ABI);
+      let tokenId = "";
+      for (const log of receipt.logs) {
+        try {
+          const p = iface.parseLog(log);
+          if (p?.name === "ContentRegistered") tokenId = p.args.tokenId.toString();
+        } catch { /* not a registry event */ }
+      }
+      setRegistered({ tokenId, txHash: receipt.hash });
+      setPortfolioKey((k) => k + 1);
+    }
+    setRegistering(false);
+  }
+
+  async function openTerms(tokenId) {
+    let initial = null;
+    try {
+      const t = await new ethers.Contract(licenseAddress, LICENSE_ABI, getSepoliaReadProvider()).listings(tokenId);
+      if (t.price > 0n || t.active) {
+        initial = {
+          price: ethers.formatEther(t.price),
+          durationDays: Number(t.duration) / 86400,
+          maxUses: Number(t.maxUses),
+          licenseType: Number(t.licenseType),
+          active: t.active,
+        };
+      }
+    } catch { /* no terms yet */ }
+    setTermsModal({ tokenId: String(tokenId), initial });
+  }
+
+  async function publishTerms(tokenId, v) {
+    const receipt = await runTx(
+      "Publish license terms",
+      (signer) =>
+        new ethers.Contract(licenseAddress, LICENSE_ABI, signer).setListingTerms(
+          tokenId, ethers.parseEther(v.price || "0"), v.durationDays * 86400, v.maxUses, v.type, v.active
+        ),
+      "License terms published"
+    );
+    if (receipt) { setPortfolioKey((k) => k + 1); setMarketKey((k) => k + 1); }
+    return Boolean(receipt);
+  }
+
+  async function buyLicense(item) {
+    const receipt = await runTx(
+      "Buy license",
+      (signer) => new ethers.Contract(licenseAddress, LICENSE_ABI, signer).buyLicense(item.tokenId, { value: item.rawPrice }),
+      "License purchased"
+    );
+    if (receipt) setVaultKey((k) => k + 1);
+    return Boolean(receipt);
+  }
+
+  const connectPrompt = (title) => (
+    <section className="card connect-prompt">
+      <h2>{title}</h2>
+      <p className="muted">Connect a wallet to continue. Your wallet is your login, so there's no account or password. You'll need a little Sepolia test ETH to cover gas.</p>
+      <button className="primary" onClick={connectWallet}>Connect wallet</button>
+    </section>
+  );
+
   return (
     <main>
       <header>
         <div className="brand">
-          <span className="eyebrow">Decentralized IP Platform</span>
-          <h1>Intellectual Property & Licensing</h1>
-          <p>Register verifiable ownership and license usage rights on Ethereum Sepolia.</p>
+          <div className="brand-row">
+            <svg className="brand-mark" viewBox="0 0 44 44" fill="none" aria-hidden="true">
+              <path d="M22 3 39 12.5v19L22 41 5 31.5v-19L22 3Z" stroke="#7b8cff" strokeWidth="2" strokeLinejoin="round" />
+              <path d="M22 3v19m0 0 17-9.5M22 22 5 12.5M22 22v19" stroke="#5ad2ff" strokeWidth="1.5" strokeLinejoin="round" opacity="0.7" />
+              <circle cx="22" cy="22" r="3.5" fill="#34d399" />
+            </svg>
+            <div>
+              <h1>IPChain</h1>
+              <p>Register ownership and license usage rights on Ethereum Sepolia.</p>
+            </div>
+          </div>
         </div>
         <div className="header-actions">
           {account && (
             isSepolia ? (
-              <div className="network-pill correct">Sepolia Testnet</div>
+              <div className="network-pill correct">Sepolia</div>
             ) : (
               <button className="network-pill wrong" onClick={ensureSepoliaNetwork}>
-                Switch to Sepolia
+                Wrong network: switch to Sepolia
               </button>
             )
           )}
           <button className="wallet" onClick={connectWallet}>
-            {account ? `${account.slice(0, 6)}...${account.slice(-4)}` : "Connect Wallet"}
+            {account ? (
+              <>
+                <span className="wallet-dot" />
+                {`${account.slice(0, 6)}…${account.slice(-4)}`}
+              </>
+            ) : (
+              "Connect wallet"
+            )}
           </button>
         </div>
       </header>
+
+      <div className="chain-strip">
+        <div className="chain-strip__item">
+          <span>IP registry</span>
+          <HashField value={registryAddress} type="address" />
+        </div>
+        <div className="chain-strip__item">
+          <span>License NFT</span>
+          <HashField value={licenseAddress} type="address" />
+        </div>
+      </div>
 
       {/* Warning banner if wrong network */}
       {account && !isSepolia && (
@@ -493,93 +527,202 @@ function App() {
         </div>
       )}
 
-      {/* Navigation Tabs */}
-      <nav className="nav-tabs">
-        <button
-          className={`nav-tab ${tab === "register" ? "active" : ""}`}
-          onClick={() => setTab("register")}
-        >
-          Registration & Proof
-        </button>
-        <button
-          className={`nav-tab ${tab === "marketplace" ? "active" : ""}`}
-          onClick={() => setTab("marketplace")}
-        >
-          Licensing Marketplace
-        </button>
-        <button
-          className={`nav-tab ${tab === "creator" ? "active" : ""}`}
-          onClick={() => setTab("creator")}
-        >
-          Creator Terms
-        </button>
-        <button
-          className={`nav-tab ${tab === "my-licenses" ? "active" : ""}`}
-          onClick={() => setTab("my-licenses")}
-        >
-          Verify & Use Licenses
-        </button>
+      <nav className="nav-tabs" aria-label="Sections">
+        {TABS.map(([id, label]) => (
+          <button key={id} className={`nav-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
+            {label}
+          </button>
+        ))}
       </nav>
 
-      {/* Tab 1: Registration & Proof */}
-      {tab === "register" && (
-        <div className="grid-2">
-          <section className="card">
-            <h2>Register IP Content</h2>
-            <p className="muted">
-              Hashes your file locally in the browser and records cryptographic ownership on Sepolia.
-            </p>
-            <label className="drop">
-              <input
-                type="file"
-                onChange={(e) => handleRegisterFileSelected(e.target.files[0])}
-              />
-              {file ? file.name : "Click or drop file to hash"}
-            </label>
-            {hash && (
-              <div className="hash-box">
-                <label>SHA-256 Digest</label>
-                <code>{hash}</code>
-              </div>
-            )}
+      {tab === "marketplace" && (
+        <>
+          {!account && (
+            <ol className="how-it-works">
+              <li><b>Register</b><span>Fingerprint your work on-chain as proof you were first.</span></li>
+              <li><b>Set terms</b><span>Choose a price, duration and license type.</span></li>
+              <li><b>Get paid</b><span>Buyers pay you directly and receive a License NFT.</span></li>
+            </ol>
+          )}
+          <Marketplace
+            key={marketKey}
+            account={account}
+            registryAddress={registryAddress}
+            registryAbi={REGISTRY_ABI}
+            licenseAddress={licenseAddress}
+            licenseAbi={LICENSE_ABI}
+            deployBlock={deployBlock}
+            onBuy={buyLicense}
+            onGoLicenses={() => setTab("licenses")}
+          />
+        </>
+      )}
 
-            {isAlreadyRegistered && (
-              <div className="result-card" style={{ marginBottom: "20px" }}>
-                <h3 style={{ color: "#ffffff" }}>ℹ Already Registered on Sepolia</h3>
-                <div className="result-row">
-                  <span>NFT Token ID</span>
-                  <strong>#{isAlreadyRegistered.tokenId}</strong>
-                </div>
-                <div className="result-row">
-                  <span>Owner</span>
-                  <strong>{isAlreadyRegistered.owner}</strong>
-                </div>
-                <div className="result-row">
-                  <span>Registered</span>
-                  <strong>{new Date(isAlreadyRegistered.timestamp * 1000).toLocaleString()}</strong>
-                </div>
-              </div>
-            )}
+      {tab === "register" && (!account ? connectPrompt("Register your work") : (
+        <section className="card flow-card">
+          <ol className="stepper">
+            <li className={file ? "done" : "current"}>Choose file</li>
+            <li className={registered ? "done" : hash ? "current" : ""}>Register on-chain</li>
+            <li className={registered ? "current" : ""}>Set license terms</li>
+          </ol>
 
-            <div className="form-group">
-              <label>Optional IPFS CID / URI</label>
-              <input
-                type="text"
-                placeholder="ipfs://bafy..."
-                value={cid}
-                onChange={(e) => setCid(e.target.value)}
-              />
+          {registered ? (
+            <div className="success-panel">
+              <h2>Your work is registered</h2>
+              <p className="muted">
+                {registered.tokenId ? `It now exists on-chain as IP #${registered.tokenId}. ` : "It now exists on-chain. "}
+                Next, decide whether others can license it.
+              </p>
+              <HashField value={registered.txHash} type="tx" label="Transaction" />
+              <div className="row-actions">
+                {registered.tokenId && <button className="primary" onClick={() => openTerms(registered.tokenId)}>Set license terms</button>}
+                <button className="secondary" onClick={() => setTab("portfolio")}>View my IP</button>
+                <button className="secondary" onClick={resetRegister}>Register another</button>
+              </div>
             </div>
-            <button
-              className="primary"
-              onClick={registerContent}
-              disabled={Boolean(isAlreadyRegistered)}
-            >
-              {isAlreadyRegistered ? "Already Registered On-Chain" : "Register On Sepolia"}
-            </button>
-            {registerStatus && <div className="status-msg">{registerStatus}</div>}
-          </section>
+          ) : (
+            <>
+              <h2>Register your work</h2>
+              <p className="muted">
+                Your file's fingerprint (SHA-256) is calculated in your browser and recorded on-chain with a timestamp. The file is also pinned to IPFS so it can be retrieved later.
+              </p>
+              <label className="drop">
+                <input type="file" onChange={(e) => handleRegisterFileSelected(e.target.files[0])} />
+                {file ? file.name : "Click to choose a file, or drop it here"}
+              </label>
+              {hash && <HashField value={hash} full label="File fingerprint" />}
+              {isAlreadyRegistered && (
+                <div className="result-card">
+                  <h3>This file is already registered</h3>
+                  <div className="result-row"><span>IP token</span><strong>#{isAlreadyRegistered.tokenId}</strong></div>
+                  <div className="result-row"><span>Owner</span><HashField value={isAlreadyRegistered.owner} type="address" /></div>
+                </div>
+              )}
+              <div className="form-group">
+                <label>IPFS link (optional)</label>
+                <input type="text" placeholder="ipfs://bafy… (filled in automatically when pinning works)" value={cid} onChange={(e) => setCid(e.target.value)} />
+              </div>
+              <button className="primary" onClick={registerContent} disabled={!hash || Boolean(isAlreadyRegistered) || registering}>
+                {registering ? registerStep || "Confirm in your wallet…" : isAlreadyRegistered ? "Already registered" : "Register on Sepolia"}
+              </button>
+            </>
+          )}
+        </section>
+      ))}
 
+      {tab === "portfolio" && (!account ? connectPrompt("Your registered IP") : (
+        <CreatorPortfolio
+          key={portfolioKey}
+          account={account}
+          isSepolia={isSepolia}
+          registryAddress={registryAddress}
+          registryAbi={REGISTRY_ABI}
+          licenseAddress={licenseAddress}
+          licenseAbi={LICENSE_ABI}
+          deployBlock={deployBlock}
+          onManageTerms={openTerms}
+          onRegister={() => setTab("register")}
+        />
+      ))}
+
+      {tab === "licenses" && (!account ? connectPrompt("Your licenses") : (
+        <>
+          <LicenseeVault
+            key={vaultKey}
+            account={account}
+            isSepolia={isSepolia}
+            licenseAddress={licenseAddress}
+            licenseAbi={LICENSE_ABI}
+            deployBlock={deployBlock}
+          />
+          <details className="advanced">
+            <summary>Advanced: look up or revoke any license by ID</summary>
+            <section className="card advanced-body">
+              <h2>Verify & Use License NFT</h2>
+              <p className="muted">
+                Inspect the on-chain validity of a License NFT on Sepolia and trigger usage entitlements.
+              </p>
+              <div className="form-group">
+                <label>License NFT Token ID</label>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <input
+                    type="number"
+                    placeholder="e.g. 1"
+                    value={inspectLicenseId}
+                    onChange={(e) => setInspectLicenseId(e.target.value)}
+                  />
+                  <button className="secondary" onClick={inspectLicense}>
+                    Inspect License
+                  </button>
+                </div>
+              </div>
+
+              {licenseData && (
+                <div className="result-card">
+                  <h3>License NFT #{inspectLicenseId}</h3>
+                  <div className="result-row">
+                    <span>License Validity</span>
+                    <span className={`badge ${licenseValid ? "active" : "inactive"}`}>
+                      {licenseValid ? "Valid & Active" : "Invalid / Expired / Exhausted"}
+                    </span>
+                  </div>
+                  <div className="result-row">
+                    <span>Parent IP Token</span>
+                    <strong>#{licenseData.parentTokenId}</strong>
+                  </div>
+                  <div className="result-row">
+                    <span>Licensee (Owner)</span>
+                    <strong>{licenseOwner}</strong>
+                  </div>
+                  <div className="result-row">
+                    <span>Licensor (Creator)</span>
+                    <strong>{licenseData.licensor}</strong>
+                  </div>
+                  <div className="result-row">
+                    <span>Type</span>
+                    <strong>{LICENSE_TYPES[licenseData.licenseType] || "Personal"}</strong>
+                  </div>
+                  <div className="result-row">
+                    <span>Usage</span>
+                    <strong>
+                      {licenseData.used} / {licenseData.maxUses === 0 ? "Unlimited" : licenseData.maxUses}
+                    </strong>
+                  </div>
+                  <div className="result-row">
+                    <span>Expiration</span>
+                    <strong>
+                      {licenseData.endTime === 0
+                        ? "Never (Perpetual)"
+                        : new Date(licenseData.endTime * 1000).toLocaleString()}
+                    </strong>
+                  </div>
+
+                  <div style={{ display: "flex", gap: "10px", marginTop: "16px" }}>
+                    <button
+                      className="primary"
+                      onClick={triggerUseLicense}
+                      disabled={!licenseValid || account.toLowerCase() !== licenseOwner.toLowerCase()}
+                    >
+                      Use License Right
+                    </button>
+                    <button
+                      className="secondary"
+                      onClick={triggerRevokeLicense}
+                      disabled={!licenseData.active}
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              )}
+              {licenseStatus && <div className="status-msg">{licenseStatus}</div>}
+            </section>
+          </details>
+        </>
+      ))}
+
+      {tab === "verify" && (
+        <div className="narrow">
           <section className="card">
             <h2>Verify Ownership Evidence</h2>
             <p className="muted">
@@ -608,7 +751,7 @@ function App() {
                 <h3>✓ Verifiable On-Chain Record</h3>
                 <div className="result-row">
                   <span>Registered Owner</span>
-                  <strong>{verifyResult.owner}</strong>
+                  <HashField value={verifyResult.owner} type="address" />
                 </div>
                 <div className="result-row">
                   <span>Token ID</span>
@@ -642,224 +785,13 @@ function App() {
         </div>
       )}
 
-      {/* Tab 2: Licensing Marketplace */}
-      {tab === "marketplace" && (
-        <section className="card" style={{ maxWidth: "680px", margin: "0 auto" }}>
-          <h2>Buy License NFT</h2>
-          <p className="muted">
-            Acquire rights (personal, commercial, or exclusive) by purchasing an official License NFT on Sepolia.
-          </p>
-          <div className="form-group">
-            <label>IP Token ID to License</label>
-            <div style={{ display: "flex", gap: "10px" }}>
-              <input
-                type="number"
-                placeholder="e.g. 1"
-                value={marketTokenId}
-                onChange={(e) => setMarketTokenId(e.target.value)}
-              />
-              <button className="secondary" onClick={queryMarketTerms}>
-                Inspect Terms
-              </button>
-            </div>
-          </div>
-
-          {marketTerms && (
-            <div className="result-card">
-              <h3>Licensing Terms for IP #{marketTokenId}</h3>
-              <div className="result-row">
-                <span>Status</span>
-                <span className={`badge ${marketTerms.active ? "active" : "inactive"}`}>
-                  {marketTerms.active ? "Open for Purchase" : "Inactive"}
-                </span>
-              </div>
-              <div className="result-row">
-                <span>Price</span>
-                <strong>{marketTerms.price} Sepolia ETH</strong>
-              </div>
-              <div className="result-row">
-                <span>License Type</span>
-                <strong>{LICENSE_TYPES[marketTerms.licenseType] || "Standard"}</strong>
-              </div>
-              <div className="result-row">
-                <span>Duration</span>
-                <strong>{marketTerms.duration === 0 ? "Perpetual" : `${marketTerms.duration / 86400} days`}</strong>
-              </div>
-              <div className="result-row">
-                <span>Usage Limit</span>
-                <strong>{marketTerms.maxUses === 0 ? "Unlimited" : `${marketTerms.maxUses} uses`}</strong>
-              </div>
-
-              <div style={{ marginTop: "16px" }}>
-                <button
-                  className="primary"
-                  onClick={buyLicenseNft}
-                  disabled={!marketTerms.active}
-                >
-                  Purchase License NFT ({marketTerms.price} ETH)
-                </button>
-              </div>
-            </div>
-          )}
-          {marketStatus && <div className="status-msg">{marketStatus}</div>}
-        </section>
-      )}
-
-      {/* Tab 3: Creator Terms */}
-      {tab === "creator" && (
-        <section className="card" style={{ maxWidth: "680px", margin: "0 auto" }}>
-          <h2>Set Licensing Terms</h2>
-          <p className="muted">
-            Configure prices and parameters for users wishing to buy rights to your registered IP NFT on Sepolia.
-          </p>
-          <div className="form-group">
-            <label>Your Registered Parent IP Token ID</label>
-            <input
-              type="number"
-              placeholder="e.g. 1"
-              value={termsTokenId}
-              onChange={(e) => setTermsTokenId(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label>License Price (Sepolia ETH)</label>
-            <input
-              type="text"
-              placeholder="0.05"
-              value={termsPrice}
-              onChange={(e) => setTermsPrice(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label>Duration in Days (0 = Perpetual)</label>
-            <input
-              type="number"
-              placeholder="30"
-              value={termsDurationDays}
-              onChange={(e) => setTermsDurationDays(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label>Max Uses (0 = Unlimited)</label>
-            <input
-              type="number"
-              placeholder="100"
-              value={termsMaxUses}
-              onChange={(e) => setTermsMaxUses(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label>License Type</label>
-            <select
-              value={termsType}
-              onChange={(e) => setTermsType(e.target.value)}
-            >
-              <option value={0}>Personal</option>
-              <option value={1}>Commercial</option>
-              <option value={2}>Exclusive</option>
-            </select>
-          </div>
-          <div className="form-group" style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <input
-              type="checkbox"
-              id="activeTerms"
-              checked={termsActive}
-              onChange={(e) => setTermsActive(e.target.checked)}
-            />
-            <label htmlFor="activeTerms" style={{ margin: 0, cursor: "pointer" }}>
-              Make License Active for Purchase
-            </label>
-          </div>
-
-          <button className="primary" onClick={configureTerms}>
-            Publish Licensing Terms
-          </button>
-          {termsStatus && <div className="status-msg">{termsStatus}</div>}
-        </section>
-      )}
-
-      {/* Tab 4: Verify & Use Licenses */}
-      {tab === "my-licenses" && (
-        <section className="card" style={{ maxWidth: "680px", margin: "0 auto" }}>
-          <h2>Verify & Use License NFT</h2>
-          <p className="muted">
-            Inspect the on-chain validity of a License NFT on Sepolia and trigger usage entitlements.
-          </p>
-          <div className="form-group">
-            <label>License NFT Token ID</label>
-            <div style={{ display: "flex", gap: "10px" }}>
-              <input
-                type="number"
-                placeholder="e.g. 1"
-                value={inspectLicenseId}
-                onChange={(e) => setInspectLicenseId(e.target.value)}
-              />
-              <button className="secondary" onClick={inspectLicense}>
-                Inspect License
-              </button>
-            </div>
-          </div>
-
-          {licenseData && (
-            <div className="result-card">
-              <h3>License NFT #{inspectLicenseId}</h3>
-              <div className="result-row">
-                <span>License Validity</span>
-                <span className={`badge ${licenseValid ? "active" : "inactive"}`}>
-                  {licenseValid ? "Valid & Active" : "Invalid / Expired / Exhausted"}
-                </span>
-              </div>
-              <div className="result-row">
-                <span>Parent IP Token</span>
-                <strong>#{licenseData.parentTokenId}</strong>
-              </div>
-              <div className="result-row">
-                <span>Licensee (Owner)</span>
-                <strong>{licenseOwner}</strong>
-              </div>
-              <div className="result-row">
-                <span>Licensor (Creator)</span>
-                <strong>{licenseData.licensor}</strong>
-              </div>
-              <div className="result-row">
-                <span>Type</span>
-                <strong>{LICENSE_TYPES[licenseData.licenseType] || "Personal"}</strong>
-              </div>
-              <div className="result-row">
-                <span>Usage</span>
-                <strong>
-                  {licenseData.used} / {licenseData.maxUses === 0 ? "Unlimited" : licenseData.maxUses}
-                </strong>
-              </div>
-              <div className="result-row">
-                <span>Expiration</span>
-                <strong>
-                  {licenseData.endTime === 0
-                    ? "Never (Perpetual)"
-                    : new Date(licenseData.endTime * 1000).toLocaleString()}
-                </strong>
-              </div>
-
-              <div style={{ display: "flex", gap: "10px", marginTop: "16px" }}>
-                <button
-                  className="primary"
-                  onClick={triggerUseLicense}
-                  disabled={!licenseValid || account.toLowerCase() !== licenseOwner.toLowerCase()}
-                >
-                  Use License Right
-                </button>
-                <button
-                  className="secondary"
-                  onClick={triggerRevokeLicense}
-                  disabled={!licenseData.active}
-                >
-                  Revoke
-                </button>
-              </div>
-            </div>
-          )}
-          {licenseStatus && <div className="status-msg">{licenseStatus}</div>}
-        </section>
+      {termsModal && (
+        <TermsModal
+          tokenId={termsModal.tokenId}
+          initial={termsModal.initial}
+          onClose={() => setTermsModal(null)}
+          onSubmit={(v) => publishTerms(termsModal.tokenId, v)}
+        />
       )}
 
       {/* Feature summary footer */}
@@ -881,6 +813,7 @@ function App() {
           <span>Configurable creator royalty standards and direct payout flows</span>
         </div>
       </footer>
+      <ToastContainer toasts={toasts} onDismiss={removeToast} />
     </main>
   );
 }
